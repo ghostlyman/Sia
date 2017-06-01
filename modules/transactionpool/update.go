@@ -19,7 +19,9 @@ func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 	tp.mu.Lock()
 
 	// Update the database of confirmed transactions.
+	var revertedSets [][]types.Transaction
 	for _, block := range cc.RevertedBlocks {
+		revertedSets = append(revertedSets, block.Transactions)
 		for _, txn := range block.Transactions {
 			err := tp.deleteTransaction(tp.dbTx, txn.ID())
 			if err != nil {
@@ -27,7 +29,9 @@ func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 			}
 		}
 	}
+	var appliedSets [][]types.Transaction
 	for _, block := range cc.AppliedBlocks {
+		appliedSets = append(appliedSets, block.Transactions)
 		for _, txn := range block.Transactions {
 			err := tp.addTransaction(tp.dbTx, txn.ID())
 			if err != nil {
@@ -35,38 +39,45 @@ func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 			}
 		}
 	}
+	appliedAndRevertedSets := append(appliedSets, revertedSets...)
+
 	err := tp.putRecentConsensusChange(tp.dbTx, cc.ID)
 	if err != nil {
 		tp.log.Println("ERROR: could not update the recent consensus change:", err)
 	}
 
-	// Scan the applied blocks for transactions that got accepted. This will
-	// help to determine which transactions to remove from the transaction
-	// pool. Having this list enables both efficiency improvements and helps to
-	// clean out transactions with no dependencies, such as arbitrary data
-	// transactions from the host.
+	// try adding every transaction in the consensus change back into the pool
+	// one at a time, starting with the oldest.
+	var validTransactions [][]types.Transaction
+	for i := len(appliedAndRevertedSets) - 1; i >= 0; i-- {
+		var validSet []types.Transaction
+		tSet := appliedAndRevertedSets[i]
+		for j := len(tSet) - 1; j >= 0; j-- {
+			txn := tSet[j]
+			err = tp.acceptTransactionSet([]types.Transaction{txn}, cc.TryTransactionSet)
+			if err == nil || err == modules.ErrDuplicateTransactionSet {
+				validSet = append(validSet, txn)
+
+				// if this transaction is valid, make sure it gets added back to the
+				// database of confirmed transactions, since it could have been in a
+				// reverted block.
+				err = tp.addTransaction(tp.dbTx, txn.ID())
+				if err != nil {
+					tp.log.Println("ERROR: could not add a transaction:", err)
+				}
+			}
+		}
+		validTransactions = append(validTransactions, validSet)
+	}
+
+	// construct a map of transaction ids, containing every valid confirmed
+	// transaction id in the ConsensusChange.
 	txids := make(map[types.TransactionID]struct{})
-	for _, block := range cc.AppliedBlocks {
-		for _, txn := range block.Transactions {
+	for _, txnSet := range validTransactions {
+		for _, txn := range txnSet {
 			txids[txn.ID()] = struct{}{}
 		}
 	}
-
-	// TODO: Right now, transactions that were reverted to not get saved and
-	// retried, because some transactions such as storage proofs might be
-	// illegal, and there's no good way to preserve dependencies when illegal
-	// transactions are suddenly involved.
-	//
-	// One potential solution is to have modules manually do resubmission if
-	// something goes wrong. Another is to have the transaction pool remember
-	// recent transaction sets on the off chance that they become valid again
-	// due to a reorg.
-	//
-	// Another option is to scan through the blocks transactions one at a time
-	// check if they are valid. If so, lump them in a set with the next guy.
-	// When they stop being valid, you've found a guy to throw away. It's n^2
-	// in the number of transactions in the block.
-
 	// Save all of the current unconfirmed transaction sets into a list.
 	var unconfirmedSets [][]types.Transaction
 	for _, tSet := range tp.transactionSets {
